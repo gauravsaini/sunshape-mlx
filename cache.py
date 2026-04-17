@@ -852,6 +852,52 @@ class HybridSunShapeKVCache:
         return self._buffer_offset
 
     # ------------------------------------------------------------------ #
+    #  Raw packed value access (for fused dequant kernel)                  #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def values_packed_raw(self) -> mx.array | None:
+        """Raw packed uint32 value data for fused dequant kernel.
+
+        Returns None if value backend is not 'grouped' or no compressed tokens exist.
+        Shape: (B, n_kv_heads, T_compressed, packed_dim) uint32
+        """
+        if self.value_backend != "grouped" or self._values_packed is None or self._compressed_offset == 0:
+            return None
+        return self._values_packed[:, :, :self._compressed_offset, :]
+
+    @property
+    def value_scales_raw(self) -> mx.array | None:
+        """Raw per-group scales for fused dequant kernel.
+
+        Shape: (B, n_kv_heads, T_compressed, n_groups) float32
+        """
+        if self.value_backend != "grouped" or self._value_scales is None or self._compressed_offset == 0:
+            return None
+        return self._value_scales[:, :, :self._compressed_offset, :]
+
+    @property
+    def value_zeros_raw(self) -> mx.array | None:
+        """Raw per-group zeros for fused dequant kernel.
+
+        Shape: (B, n_kv_heads, T_compressed, n_groups) float32
+        """
+        if self.value_backend != "grouped" or self._value_zeros is None or self._compressed_offset == 0:
+            return None
+        return self._value_zeros[:, :, :self._compressed_offset, :]
+
+    @property
+    def can_fuse_value_dequant(self) -> bool:
+        """Whether the fused dequant kernel can be used for this cache's values."""
+        return (
+            self.value_backend == "grouped"
+            and self._compressed_offset > 0
+            and self._values_packed is not None
+            and self._value_scales is not None
+            and self._value_zeros is not None
+        )
+
+    # ------------------------------------------------------------------ #
     #  Memory estimation                                                   #
     # ------------------------------------------------------------------ #
 

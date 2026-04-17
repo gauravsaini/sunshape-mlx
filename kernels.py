@@ -539,6 +539,346 @@ def fused_block_vq_attention(
 
 
 # ================================================================== #
+#  Metal kernel: Fused attention + in-register value dequantization   #
+#  (Eliminates the dequantization wall)                               #
+# ================================================================== #
+#
+# Instead of pre-dequantizing the entire value cache to float32 before
+# kernel launch, this kernel reads:
+#   - packed uint32 words (containing 2/4-bit quantized values)
+#   - per-group scales and zeros
+# and dequantizes each value on-the-fly in registers.
+#
+# Memory bandwidth savings (per token per threadgroup):
+#   4-bit: 72 bytes vs 512 bytes (7.1× reduction)
+#   2-bit: 40 bytes vs 512 bytes (12.8× reduction)
+#
+# Uses the same thread-per-dimension layout as the optimized attention
+# kernel: each thread owns exactly one output dimension, so it knows
+# exactly which packed word, sub-value, group scale and zero to read.
+#
+# Grid: (n_qh * head_dim, 1, 1)
+# Threadgroup: (head_dim, 1, 1)
+
+_FUSED_ATTENTION_DEQUANT_SOURCE = r"""
+// -------------------------------------------------------------------
+// Fused attention + in-register value dequantization kernel
+// -------------------------------------------------------------------
+// Inputs:
+//   qdots:         (n_qh, n_blocks, n_centroids) float32
+//   indices:       (T_kv, n_blocks)              uint8/uint16  — key VQ indices
+//   packed_values: (T_kv, packed_dim)            uint32        — bit-packed values
+//   scales:        (T_kv, n_groups)              float32
+//   zeros:         (T_kv, n_groups)              float32
+//   params:        (8,)                          float32
+//            [0]=T_kv, [1]=n_blocks, [2]=n_centroids, [3]=head_dim,
+//            [4]=bits, [5]=vals_per_word, [6]=bit_mask, [7]=group_size
+// Output:
+//   out:           (n_qh, head_dim) float32
+// -------------------------------------------------------------------
+
+uint head_dim      = (uint)params[3];
+uint qh            = thread_position_in_grid.x / head_dim;
+uint dim_id        = thread_position_in_threadgroup.x;
+
+uint T_kv          = (uint)params[0];
+uint n_blocks      = (uint)params[1];
+uint n_centroids   = (uint)params[2];
+uint bits          = (uint)params[4];
+uint vals_per_word = (uint)params[5];
+uint bit_mask      = (uint)params[6];
+uint group_size    = (uint)params[7];
+uint n_qh          = qdots_shape[0];
+
+if (qh >= n_qh || dim_id >= head_dim) return;
+
+// Precompute per-thread dequant addressing (constant across all tokens)
+uint packed_dim = (head_dim + vals_per_word - 1) / vals_per_word;
+uint n_groups   = head_dim / group_size;
+uint word_idx   = dim_id / vals_per_word;
+uint sub_idx    = dim_id % vals_per_word;
+uint shift      = sub_idx * bits;
+uint group_idx  = dim_id / group_size;
+
+// ---- Cache qdots[qh, :, :] in threadgroup memory ----
+threadgroup float tg_qdots[4096];  // 16 * 256 max
+
+uint qdots_size = n_blocks * n_centroids;
+uint qdots_base = qh * qdots_size;
+for (uint i = dim_id; i < qdots_size; i += head_dim) {
+    tg_qdots[i] = qdots[qdots_base + i];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// ---- Per-thread online softmax state (single dimension) ----
+float m_local = -1e30f;
+float d_local = 0.0f;
+float acc     = 0.0f;
+
+// ---- Process ALL tokens ----
+for (uint t = 0; t < T_kv; t++) {
+    // Gather score from shared threadgroup memory
+    float score = 0.0f;
+    for (uint b = 0; b < n_blocks; b++) {
+        uint idx = (uint)indices[t * n_blocks + b];
+        score += tg_qdots[b * n_centroids + idx];
+    }
+
+    // Online softmax update
+    float m_new = (score > m_local) ? score : m_local;
+    float correction = exp(m_local - m_new);
+    float exp_score = exp(score - m_new);
+
+    // ---- In-register value dequantization ----
+    uint word = packed_values[t * packed_dim + word_idx];
+    uint qval = (word >> shift) & bit_mask;
+    float scale_val = scales[t * n_groups + group_idx];
+    float zero_val  = zeros[t * n_groups + group_idx];
+    float val = (float)qval * scale_val + zero_val;
+
+    d_local = d_local * correction + exp_score;
+    acc     = acc * correction + exp_score * val;
+    m_local = m_new;
+}
+
+// ---- Write output ----
+if (d_local > 0.0f) {
+    out[qh * head_dim + dim_id] = acc / d_local;
+} else {
+    out[qh * head_dim + dim_id] = 0.0f;
+}
+"""
+
+_fused_attention_dequant_kernel = mx.fast.metal_kernel(
+    name="sunshape_fused_attention_dequant",
+    input_names=["qdots", "indices", "packed_values", "scales", "zeros", "params"],
+    output_names=["out"],
+    source=_FUSED_ATTENTION_DEQUANT_SOURCE,
+)
+
+
+def fused_attention_dequant_metal(
+    qdots: mx.array,
+    indices: mx.array,
+    packed_values: mx.array,
+    scales: mx.array,
+    zeros: mx.array,
+    n_qh: int,
+    T_kv: int,
+    n_blocks: int,
+    n_centroids: int,
+    head_dim: int,
+    bits: int,
+    group_size: int,
+) -> mx.array | None:
+    """Fused attention + in-register value dequantization — single Metal kernel.
+
+    Reads packed quantized values directly and dequantizes per-thread in
+    registers, completely bypassing the dequantization wall.  No intermediate
+    float32 value tensor is materialized.
+
+    Parameters
+    ----------
+    qdots : (n_qh, n_blocks, n_centroids) float32
+    indices : (T_kv, n_blocks) uint8/uint16 — key VQ indices
+    packed_values : (T_kv, packed_dim) uint32 — bit-packed quantized values
+    scales : (T_kv, n_groups) float32 — per-group scale
+    zeros : (T_kv, n_groups) float32 — per-group zero-point
+    bits : 2 or 4
+    group_size : int
+
+    Returns None if Metal kernels are unavailable or dimensions exceed limits.
+    """
+    if T_kv == 0:
+        return mx.zeros((n_qh, head_dim), dtype=mx.float32)
+    if head_dim > 256:
+        return None
+    if n_blocks * n_centroids > _MAX_QDOTS_TG:
+        return None
+
+    vals_per_word = 32 // bits  # 16 for 2-bit, 8 for 4-bit
+    bit_mask = (1 << bits) - 1  # 0x3 for 2-bit, 0xF for 4-bit
+
+    try:
+        mx.eval(qdots, indices, packed_values, scales, zeros)
+
+        params = mx.array(
+            [float(T_kv), float(n_blocks), float(n_centroids), float(head_dim),
+             float(bits), float(vals_per_word), float(bit_mask), float(group_size)],
+            dtype=mx.float32,
+        )
+
+        grid = (n_qh * head_dim, 1, 1)
+        threadgroup = (head_dim, 1, 1)
+
+        output = _fused_attention_dequant_kernel(
+            inputs=[qdots, indices, packed_values, scales, zeros, params],
+            output_shapes=[(n_qh, head_dim)],
+            output_dtypes=[mx.float32],
+            grid=grid,
+            threadgroup=threadgroup,
+            init_value=0.0,
+        )
+        out = output[0] if isinstance(output, (list, tuple)) else output
+        mx.eval(out)
+        _record_kernel_dispatch("sunshape_fused_attention_dequant_metal")
+        return out
+    except Exception:
+        return None
+
+
+# ================================================================== #
+#  Metal kernel: Fused attention + value dequant with causal mask     #
+# ================================================================== #
+
+_FUSED_ATTENTION_DEQUANT_CAUSAL_SOURCE = r"""
+// Fused attention + in-register value dequantization with causal masking
+// params: [T_kv, n_blocks, n_centroids, head_dim, bits,
+//          vals_per_word, bit_mask, group_size, q_offset]
+
+uint head_dim      = (uint)params[3];
+uint qh            = thread_position_in_grid.x / head_dim;
+uint dim_id        = thread_position_in_threadgroup.x;
+
+uint T_kv          = (uint)params[0];
+uint n_blocks      = (uint)params[1];
+uint n_centroids   = (uint)params[2];
+uint bits          = (uint)params[4];
+uint vals_per_word = (uint)params[5];
+uint bit_mask      = (uint)params[6];
+uint group_size    = (uint)params[7];
+uint q_offset      = (uint)params[8];
+uint n_qh          = qdots_shape[0];
+
+if (qh >= n_qh || dim_id >= head_dim) return;
+
+uint q_pos = q_offset + qh;
+
+// Precompute per-thread dequant addressing
+uint packed_dim = (head_dim + vals_per_word - 1) / vals_per_word;
+uint n_groups   = head_dim / group_size;
+uint word_idx   = dim_id / vals_per_word;
+uint sub_idx    = dim_id % vals_per_word;
+uint shift      = sub_idx * bits;
+uint group_idx  = dim_id / group_size;
+
+// ---- Cache qdots in threadgroup memory ----
+threadgroup float tg_qdots[4096];
+
+uint qdots_size = n_blocks * n_centroids;
+uint qdots_base = qh * qdots_size;
+for (uint i = dim_id; i < qdots_size; i += head_dim) {
+    tg_qdots[i] = qdots[qdots_base + i];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// ---- Per-thread online softmax state ----
+float m_local = -1e30f;
+float d_local = 0.0f;
+float acc     = 0.0f;
+
+// ---- Process tokens up to causal bound ----
+for (uint t = 0; t < T_kv; t++) {
+    if (t > q_pos) continue;
+
+    float score = 0.0f;
+    for (uint b = 0; b < n_blocks; b++) {
+        uint idx = (uint)indices[t * n_blocks + b];
+        score += tg_qdots[b * n_centroids + idx];
+    }
+
+    float m_new = (score > m_local) ? score : m_local;
+    float correction = exp(m_local - m_new);
+    float exp_score = exp(score - m_new);
+
+    // ---- In-register value dequantization ----
+    uint word = packed_values[t * packed_dim + word_idx];
+    uint qval = (word >> shift) & bit_mask;
+    float scale_val = scales[t * n_groups + group_idx];
+    float zero_val  = zeros[t * n_groups + group_idx];
+    float val = (float)qval * scale_val + zero_val;
+
+    d_local = d_local * correction + exp_score;
+    acc     = acc * correction + exp_score * val;
+    m_local = m_new;
+}
+
+if (d_local > 0.0f) {
+    out[qh * head_dim + dim_id] = acc / d_local;
+} else {
+    out[qh * head_dim + dim_id] = 0.0f;
+}
+"""
+
+_fused_attention_dequant_causal_kernel = mx.fast.metal_kernel(
+    name="sunshape_fused_attention_dequant_causal",
+    input_names=["qdots", "indices", "packed_values", "scales", "zeros", "params"],
+    output_names=["out"],
+    source=_FUSED_ATTENTION_DEQUANT_CAUSAL_SOURCE,
+)
+
+
+def fused_attention_dequant_causal_metal(
+    qdots: mx.array,
+    indices: mx.array,
+    packed_values: mx.array,
+    scales: mx.array,
+    zeros: mx.array,
+    n_qh: int,
+    T_kv: int,
+    n_blocks: int,
+    n_centroids: int,
+    head_dim: int,
+    bits: int,
+    group_size: int,
+    q_offset: int = 0,
+) -> mx.array | None:
+    """Fused attention + value dequant with causal mask — single Metal kernel.
+
+    Same as fused_attention_dequant_metal but with causal masking.
+
+    Returns None if Metal kernels are unavailable or dimensions exceed limits.
+    """
+    if T_kv == 0:
+        return mx.zeros((n_qh, head_dim), dtype=mx.float32)
+    if head_dim > 256:
+        return None
+    if n_blocks * n_centroids > _MAX_QDOTS_TG:
+        return None
+
+    vals_per_word = 32 // bits
+    bit_mask = (1 << bits) - 1
+
+    try:
+        mx.eval(qdots, indices, packed_values, scales, zeros)
+
+        params = mx.array(
+            [float(T_kv), float(n_blocks), float(n_centroids), float(head_dim),
+             float(bits), float(vals_per_word), float(bit_mask), float(group_size),
+             float(q_offset)],
+            dtype=mx.float32,
+        )
+
+        grid = (n_qh * head_dim, 1, 1)
+        threadgroup = (head_dim, 1, 1)
+
+        output = _fused_attention_dequant_causal_kernel(
+            inputs=[qdots, indices, packed_values, scales, zeros, params],
+            output_shapes=[(n_qh, head_dim)],
+            output_dtypes=[mx.float32],
+            grid=grid,
+            threadgroup=threadgroup,
+            init_value=0.0,
+        )
+        out = output[0] if isinstance(output, (list, tuple)) else output
+        mx.eval(out)
+        _record_kernel_dispatch("sunshape_fused_attention_dequant_causal_metal")
+        return out
+    except Exception:
+        return None
+
+
+# ================================================================== #
 #  Metal kernel: Fused value dequantization                           #
 # ================================================================== #
 # Adapted from turboQuantPlayground's value_dequant.py.

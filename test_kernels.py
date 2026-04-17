@@ -28,6 +28,8 @@ from sunshape_mlx.kernels import (
     fused_block_vq_attention,
     fused_attention_metal,
     fused_attention_causal_metal,
+    fused_attention_dequant_metal,
+    fused_attention_dequant_causal_metal,
     block_vq_quantize_metal,
 )
 
@@ -488,6 +490,182 @@ def test_fused_attention_larger_seq():
         print("  ⚠️  Fused Metal kernel returned None, skipping.")
 
 
+def test_fused_attention_dequant_metal():
+    """Fused attention + in-register value dequantization vs reference."""
+    print("\n[15] fused_attention_dequant_metal vs reference")
+    np.random.seed(555)
+    T_q = 1
+    T_kv = 64
+    n_blocks, n_centroids, block_dim = 16, 256, 8
+    head_dim = n_blocks * block_dim
+    bits = 4
+    group_size = 64
+
+    # Random centroids, indices
+    centroids = np.random.randn(n_blocks, n_centroids, block_dim).astype(np.float32)
+    indices_np = np.random.randint(0, n_centroids, size=(T_kv, n_blocks), dtype=np.uint8)
+    query_np = np.random.randn(T_q, head_dim).astype(np.float32)
+
+    # Random values → quantize → use packed form
+    values_np = np.random.randn(T_kv, head_dim).astype(np.float32)
+    values_mx = mx.array(values_np)
+    packed, scales, zeros, n_groups = quantize_values(values_mx, bits=bits, group_size=group_size)
+    mx.eval(packed, scales, zeros)
+
+    # Dequantize for reference
+    values_deq = dequantize_values(packed, scales, zeros, D=head_dim, bits=bits, group_size=group_size)
+    mx.eval(values_deq)
+    values_deq_np = np.array(values_deq)
+
+    # Reference: explicit attention with dequantized values
+    k_hat = np.zeros((T_kv, head_dim), dtype=np.float32)
+    for b in range(n_blocks):
+        sl = slice(b * block_dim, (b + 1) * block_dim)
+        k_hat[:, sl] = centroids[b][indices_np[:, b]]
+    scores_ref = query_np @ k_hat.T
+    weights_ref = np.exp(scores_ref - scores_ref.max(axis=-1, keepdims=True))
+    weights_ref = weights_ref / weights_ref.sum(axis=-1, keepdims=True)
+    output_ref = weights_ref @ values_deq_np
+
+    # Precompute qdots
+    q_blocks = query_np.reshape(T_q, n_blocks, block_dim)
+    qdots_np = np.einsum('qbd,bcd->qbc', q_blocks, centroids)
+
+    result = fused_attention_dequant_metal(
+        mx.array(qdots_np), mx.array(indices_np),
+        packed, scales, zeros,
+        n_qh=T_q, T_kv=T_kv,
+        n_blocks=n_blocks, n_centroids=n_centroids,
+        head_dim=head_dim, bits=bits, group_size=group_size,
+    )
+
+    if result is not None:
+        mx.eval(result)
+        result_np = np.array(result)
+        max_err = np.max(np.abs(result_np - output_ref))
+        check(f"Fused dequant matches reference (max_err={max_err:.6f})", max_err < 5e-3,
+              f"max_err={max_err}")
+        check("Output shape correct", result.shape == (T_q, head_dim),
+              f"expected ({T_q}, {head_dim}), got {result.shape}")
+    else:
+        print("  ⚠️  Fused dequant Metal kernel returned None, skipping.")
+
+
+def test_fused_attention_dequant_causal_metal():
+    """Fused attention + in-register value dequant with causal mask vs reference."""
+    print("\n[16] fused_attention_dequant_causal_metal vs reference")
+    np.random.seed(666)
+    T_q = 4
+    T_kv = 32
+    n_blocks, n_centroids, block_dim = 16, 256, 8
+    head_dim = n_blocks * block_dim
+    bits = 4
+    group_size = 64
+
+    centroids = np.random.randn(n_blocks, n_centroids, block_dim).astype(np.float32)
+    indices_np = np.random.randint(0, n_centroids, size=(T_kv, n_blocks), dtype=np.uint8)
+    query_np = np.random.randn(T_q, head_dim).astype(np.float32)
+
+    values_np = np.random.randn(T_kv, head_dim).astype(np.float32)
+    values_mx = mx.array(values_np)
+    packed, scales, zeros, n_groups = quantize_values(values_mx, bits=bits, group_size=group_size)
+    mx.eval(packed, scales, zeros)
+
+    values_deq = dequantize_values(packed, scales, zeros, D=head_dim, bits=bits, group_size=group_size)
+    mx.eval(values_deq)
+    values_deq_np = np.array(values_deq)
+
+    # Reference: causal attention with dequantized values
+    k_hat = np.zeros((T_kv, head_dim), dtype=np.float32)
+    for b in range(n_blocks):
+        sl = slice(b * block_dim, (b + 1) * block_dim)
+        k_hat[:, sl] = centroids[b][indices_np[:, b]]
+    q_offset = T_kv - T_q
+    scores_ref = query_np @ k_hat.T
+    q_pos = np.arange(q_offset, q_offset + T_q)
+    k_pos = np.arange(T_kv)
+    causal = q_pos[:, None] >= k_pos[None, :]
+    scores_ref = np.where(causal, scores_ref, -1e30)
+    weights_ref = np.exp(scores_ref - scores_ref.max(axis=-1, keepdims=True))
+    weights_ref = weights_ref / weights_ref.sum(axis=-1, keepdims=True)
+    output_ref = weights_ref @ values_deq_np
+
+    q_blocks = query_np.reshape(T_q, n_blocks, block_dim)
+    qdots_np = np.einsum('qbd,bcd->qbc', q_blocks, centroids)
+
+    result = fused_attention_dequant_causal_metal(
+        mx.array(qdots_np), mx.array(indices_np),
+        packed, scales, zeros,
+        n_qh=T_q, T_kv=T_kv,
+        n_blocks=n_blocks, n_centroids=n_centroids,
+        head_dim=head_dim, bits=bits, group_size=group_size,
+        q_offset=q_offset,
+    )
+
+    if result is not None:
+        mx.eval(result)
+        result_np = np.array(result)
+        max_err = np.max(np.abs(result_np - output_ref))
+        check(f"Causal fused dequant matches reference (max_err={max_err:.6f})", max_err < 5e-3,
+              f"max_err={max_err}")
+    else:
+        print("  ⚠️  Causal fused dequant Metal kernel returned None, skipping.")
+
+
+def test_fused_attention_dequant_2bit():
+    """Fused attention + 2-bit value dequantization vs reference."""
+    print("\n[17] fused_attention_dequant_metal 2-bit vs reference")
+    np.random.seed(777)
+    T_q = 1
+    T_kv = 64
+    n_blocks, n_centroids, block_dim = 16, 256, 8
+    head_dim = n_blocks * block_dim
+    bits = 2
+    group_size = 64
+
+    centroids = np.random.randn(n_blocks, n_centroids, block_dim).astype(np.float32)
+    indices_np = np.random.randint(0, n_centroids, size=(T_kv, n_blocks), dtype=np.uint8)
+    query_np = np.random.randn(T_q, head_dim).astype(np.float32)
+    values_np = np.random.randn(T_kv, head_dim).astype(np.float32)
+
+    values_mx = mx.array(values_np)
+    packed, scales, zeros, n_groups = quantize_values(values_mx, bits=bits, group_size=group_size)
+    mx.eval(packed, scales, zeros)
+
+    values_deq = dequantize_values(packed, scales, zeros, D=head_dim, bits=bits, group_size=group_size)
+    mx.eval(values_deq)
+    values_deq_np = np.array(values_deq)
+
+    k_hat = np.zeros((T_kv, head_dim), dtype=np.float32)
+    for b in range(n_blocks):
+        sl = slice(b * block_dim, (b + 1) * block_dim)
+        k_hat[:, sl] = centroids[b][indices_np[:, b]]
+    scores_ref = query_np @ k_hat.T
+    weights_ref = np.exp(scores_ref - scores_ref.max(axis=-1, keepdims=True))
+    weights_ref = weights_ref / weights_ref.sum(axis=-1, keepdims=True)
+    output_ref = weights_ref @ values_deq_np
+
+    q_blocks = query_np.reshape(T_q, n_blocks, block_dim)
+    qdots_np = np.einsum('qbd,bcd->qbc', q_blocks, centroids)
+
+    result = fused_attention_dequant_metal(
+        mx.array(qdots_np), mx.array(indices_np),
+        packed, scales, zeros,
+        n_qh=T_q, T_kv=T_kv,
+        n_blocks=n_blocks, n_centroids=n_centroids,
+        head_dim=head_dim, bits=bits, group_size=group_size,
+    )
+
+    if result is not None:
+        mx.eval(result)
+        result_np = np.array(result)
+        max_err = np.max(np.abs(result_np - output_ref))
+        check(f"2-bit fused dequant matches reference (max_err={max_err:.6f})", max_err < 5e-3,
+              f"max_err={max_err}")
+    else:
+        print("  ⚠️  2-bit fused dequant Metal kernel returned None, skipping.")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("SunShape MLX Kernel Validation Suite")
@@ -508,6 +686,9 @@ if __name__ == "__main__":
         test_fused_attention_causal_metal,
         test_block_vq_quantize_metal,
         test_fused_attention_larger_seq,
+        test_fused_attention_dequant_metal,
+        test_fused_attention_dequant_causal_metal,
+        test_fused_attention_dequant_2bit,
     ]
 
     for t in tests:
