@@ -1,0 +1,67 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+env/
+venv/
+ENV/
+
+# Testing
+.pytest_cache/
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Local project specific
+results/
+local_runs/
+local_runs_mac/
+local_runs_mac_new/
+downstream_ablation/
+generate_compare/
+niah/
+realtrace_compare/
+traces/
+triton_validation/
+runs/
+
+# Logs and outputs
+*.log
+*.zip
+out.txt
+proof_output.txt
+
+# IDEs
+.idea/
+.vscode/
+
+# Hide messy exploration directories for cleanly publishing
+colabs/
+bash_scripts/
+scripts/
+tests/
+docs/
+
+# MLX / Binary / Model Data
+*.pt
+*.safetensors
+*.bin
+*.npy
+*.npz
+*.mlx
+*.metallib
+
