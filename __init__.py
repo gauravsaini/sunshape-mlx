@@ -44,13 +44,16 @@ from sunshape_mlx.kernels import (
     quantize_values,
     dequantize_values,
     fused_block_vq_attention,
+    fused_attention_metal,
+    fused_attention_causal_metal,
+    block_vq_quantize_metal,
     get_kernel_stats,
     reset_kernel_stats,
 )
 from sunshape_mlx.value_codecs import GroupedValueCodec, TurboQuantValueCodec
 from sunshape_mlx.turboquant_runtime import TurboQuantKVCache, turboquant_sdpa
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "SunShapeBlockCodec",
@@ -74,6 +77,9 @@ __all__ = [
     "quantize_values",
     "dequantize_values",
     "fused_block_vq_attention",
+    "fused_attention_metal",
+    "fused_attention_causal_metal",
+    "block_vq_quantize_metal",
     "GroupedValueCodec",
     "TurboQuantValueCodec",
     "TurboQuantKVCache",

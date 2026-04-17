@@ -8,6 +8,9 @@ Tests correctness of:
 5. fused_block_vq_attention vs explicit reference
 6. 3-bit packing edge cases (non-divisible dims)
 7. Value quantization numerical fidelity
+8. Fused online-softmax attention vs explicit reference
+9. Fused online-softmax with causal mask vs explicit reference
+10. Vectorized block-VQ quantize vs numpy reference
 """
 
 import sys
@@ -23,6 +26,9 @@ from sunshape_mlx.kernels import (
     quantize_scalar_to_indices,
     block_vq_score_metal,
     fused_block_vq_attention,
+    fused_attention_metal,
+    fused_attention_causal_metal,
+    block_vq_quantize_metal,
 )
 
 PASS = 0
@@ -297,6 +303,191 @@ def test_block_vq_score_shape():
         print("  ⚠️  Metal kernel unavailable, skipping shape check.")
 
 
+def test_fused_attention_metal():
+    """Fused online-softmax Metal kernel vs explicit 2-pass reference."""
+    print("\n[11] fused_attention_metal (online softmax) vs reference")
+    np.random.seed(111)
+    T_q, T_kv = 1, 64
+    n_blocks, n_centroids, block_dim = 16, 256, 8
+    head_dim = n_blocks * block_dim
+
+    # Random centroids, indices, values
+    centroids = np.random.randn(n_blocks, n_centroids, block_dim).astype(np.float32)
+    indices_np = np.random.randint(0, n_centroids, size=(T_kv, n_blocks), dtype=np.uint8)
+    values_np = np.random.randn(T_kv, head_dim).astype(np.float32)
+    query_np = np.random.randn(T_q, head_dim).astype(np.float32)
+
+    # Reconstruct keys from centroids
+    k_hat = np.zeros((T_kv, head_dim), dtype=np.float32)
+    for b in range(n_blocks):
+        sl = slice(b * block_dim, (b + 1) * block_dim)
+        k_hat[:, sl] = centroids[b][indices_np[:, b]]
+
+    # Reference: explicit attention (no causal mask)
+    scores_ref = query_np @ k_hat.T
+    weights_ref = np.exp(scores_ref - scores_ref.max(axis=-1, keepdims=True))
+    weights_ref = weights_ref / weights_ref.sum(axis=-1, keepdims=True)
+    output_ref = weights_ref @ values_np
+
+    # Precompute qdots
+    q_blocks = query_np.reshape(T_q, n_blocks, block_dim)
+    qdots_np = np.einsum('qbd,bcd->qbc', q_blocks, centroids)
+
+    result = fused_attention_metal(
+        mx.array(qdots_np), mx.array(indices_np), mx.array(values_np),
+        n_qh=T_q, T_kv=T_kv,
+        n_blocks=n_blocks, n_centroids=n_centroids,
+        head_dim=head_dim,
+    )
+
+    if result is not None:
+        mx.eval(result)
+        result_np = np.array(result)
+        max_err = np.max(np.abs(result_np - output_ref))
+        check(f"Fused Metal matches reference (max_err={max_err:.6f})", max_err < 5e-3,
+              f"max_err={max_err}")
+        check("Output shape correct", result.shape == (T_q, head_dim),
+              f"expected ({T_q}, {head_dim}), got {result.shape}")
+    else:
+        print("  ⚠️  Fused Metal kernel returned None, skipping.")
+
+
+def test_fused_attention_causal_metal():
+    """Fused online-softmax with causal mask vs explicit reference."""
+    print("\n[12] fused_attention_causal_metal vs reference")
+    np.random.seed(222)
+    T_q = 4
+    T_kv = 32
+    n_blocks, n_centroids, block_dim = 16, 256, 8
+    head_dim = n_blocks * block_dim
+
+    centroids = np.random.randn(n_blocks, n_centroids, block_dim).astype(np.float32)
+    indices_np = np.random.randint(0, n_centroids, size=(T_kv, n_blocks), dtype=np.uint8)
+    values_np = np.random.randn(T_kv, head_dim).astype(np.float32)
+    query_np = np.random.randn(T_q, head_dim).astype(np.float32)
+
+    # Reconstruct keys
+    k_hat = np.zeros((T_kv, head_dim), dtype=np.float32)
+    for b in range(n_blocks):
+        sl = slice(b * block_dim, (b + 1) * block_dim)
+        k_hat[:, sl] = centroids[b][indices_np[:, b]]
+
+    # Reference: causal attention
+    q_offset = T_kv - T_q
+    scores_ref = query_np @ k_hat.T  # (T_q, T_kv)
+    q_pos = np.arange(q_offset, q_offset + T_q)
+    k_pos = np.arange(T_kv)
+    causal = q_pos[:, None] >= k_pos[None, :]
+    scores_ref = np.where(causal, scores_ref, -1e30)
+    weights_ref = np.exp(scores_ref - scores_ref.max(axis=-1, keepdims=True))
+    weights_ref = weights_ref / weights_ref.sum(axis=-1, keepdims=True)
+    output_ref = weights_ref @ values_np
+
+    # Precompute qdots
+    q_blocks = query_np.reshape(T_q, n_blocks, block_dim)
+    qdots_np = np.einsum('qbd,bcd->qbc', q_blocks, centroids)
+
+    result = fused_attention_causal_metal(
+        mx.array(qdots_np), mx.array(indices_np), mx.array(values_np),
+        n_qh=T_q, T_kv=T_kv,
+        n_blocks=n_blocks, n_centroids=n_centroids,
+        head_dim=head_dim,
+        q_offset=q_offset,
+    )
+
+    if result is not None:
+        mx.eval(result)
+        result_np = np.array(result)
+        max_err = np.max(np.abs(result_np - output_ref))
+        check(f"Causal fused matches reference (max_err={max_err:.6f})", max_err < 5e-3,
+              f"max_err={max_err}")
+    else:
+        print("  ⚠️  Causal fused Metal kernel returned None, skipping.")
+
+
+def test_block_vq_quantize_metal():
+    """Vectorized Metal block-VQ quantize vs numpy reference."""
+    print("\n[13] block_vq_quantize_metal vs numpy reference")
+    np.random.seed(333)
+    N = 32
+    n_blocks, n_centroids, block_dim = 16, 256, 8
+    head_dim = n_blocks * block_dim
+
+    keys = np.random.randn(N, head_dim).astype(np.float32)
+    centroids = np.random.randn(n_blocks, n_centroids, block_dim).astype(np.float32)
+
+    # Numpy reference
+    ref_indices = np.zeros((N, n_blocks), dtype=np.int32)
+    for b in range(n_blocks):
+        sl = slice(b * block_dim, (b + 1) * block_dim)
+        k_blk = keys[:, sl]
+        c_blk = centroids[b]
+        diff = k_blk[:, None, :] - c_blk[None, :, :]
+        dists = np.sum(diff ** 2, axis=-1)
+        ref_indices[:, b] = np.argmin(dists, axis=1)
+
+    result = block_vq_quantize_metal(
+        mx.array(keys), mx.array(centroids),
+        n_blocks=n_blocks, n_centroids=n_centroids,
+        block_dim=block_dim, head_dim=head_dim,
+    )
+
+    if result is not None:
+        mx.eval(result)
+        result_np = np.array(result).astype(np.int32)
+        match = np.array_equal(result_np, ref_indices)
+        n_mismatch = np.sum(result_np != ref_indices)
+        check(f"Metal VQ quantize matches numpy reference", match,
+              f"{n_mismatch}/{N * n_blocks} mismatches")
+    else:
+        print("  ⚠️  Metal VQ quantize kernel returned None, skipping.")
+
+
+def test_fused_attention_larger_seq():
+    """Fused attention with larger T_kv to test multi-simdgroup reduction."""
+    print("\n[14] Fused attention with larger sequence (T_kv=512)")
+    np.random.seed(444)
+    T_q = 1
+    T_kv = 512
+    n_blocks, n_centroids, block_dim = 16, 256, 8
+    head_dim = n_blocks * block_dim
+
+    centroids = np.random.randn(n_blocks, n_centroids, block_dim).astype(np.float32)
+    indices_np = np.random.randint(0, n_centroids, size=(T_kv, n_blocks), dtype=np.uint8)
+    values_np = np.random.randn(T_kv, head_dim).astype(np.float32) * 0.1
+    query_np = np.random.randn(T_q, head_dim).astype(np.float32) * 0.1
+
+    # Reference
+    k_hat = np.zeros((T_kv, head_dim), dtype=np.float32)
+    for b in range(n_blocks):
+        sl = slice(b * block_dim, (b + 1) * block_dim)
+        k_hat[:, sl] = centroids[b][indices_np[:, b]]
+
+    scores_ref = query_np @ k_hat.T
+    weights_ref = np.exp(scores_ref - scores_ref.max(axis=-1, keepdims=True))
+    weights_ref = weights_ref / weights_ref.sum(axis=-1, keepdims=True)
+    output_ref = weights_ref @ values_np
+
+    q_blocks = query_np.reshape(T_q, n_blocks, block_dim)
+    qdots_np = np.einsum('qbd,bcd->qbc', q_blocks, centroids)
+
+    result = fused_attention_metal(
+        mx.array(qdots_np), mx.array(indices_np), mx.array(values_np),
+        n_qh=T_q, T_kv=T_kv,
+        n_blocks=n_blocks, n_centroids=n_centroids,
+        head_dim=head_dim,
+    )
+
+    if result is not None:
+        mx.eval(result)
+        result_np = np.array(result)
+        max_err = np.max(np.abs(result_np - output_ref))
+        check(f"Large-seq fused matches reference (max_err={max_err:.6f})", max_err < 0.01,
+              f"max_err={max_err}")
+    else:
+        print("  ⚠️  Fused Metal kernel returned None, skipping.")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("SunShape MLX Kernel Validation Suite")
@@ -313,6 +504,10 @@ if __name__ == "__main__":
         test_value_dequant_source_syntax,
         test_3bit_overflow,
         test_block_vq_score_shape,
+        test_fused_attention_metal,
+        test_fused_attention_causal_metal,
+        test_block_vq_quantize_metal,
+        test_fused_attention_larger_seq,
     ]
 
     for t in tests:

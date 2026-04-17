@@ -18,7 +18,7 @@ from typing import NamedTuple
 import mlx.core as mx
 import numpy as np
 
-from sunshape_mlx.kernels import block_vq_score_metal
+from sunshape_mlx.kernels import block_vq_quantize_metal, block_vq_score_metal
 from sunshape_mlx.rotation import (
     generate_rotation_matrix,
     covariance_block_permutation,
@@ -436,7 +436,6 @@ class SunShapeBlockCodec:
         keys = self._forward_transform(keys)
 
         N = keys.shape[0]
-        indices = mx.zeros((N, self.n_blocks), dtype=mx.int32)
         passthrough_values = None
 
         if (
@@ -447,7 +446,30 @@ class SunShapeBlockCodec:
                 (N, self.n_blocks, self.block_dim), dtype=mx.float32
             )
 
-        # Use numpy for the argmin loop (MLX doesn't have cdist)
+        # ---- Fast path: vectorized Metal kernel ----
+        # Usable when E is identity and no mixed-precision blocks
+        e_is_identity = self.mode in {
+            "profileperm_baseline", "rotated",
+        }
+        if e_is_identity and passthrough_values is None:
+            metal_indices = block_vq_quantize_metal(
+                keys, self.centroids,
+                n_blocks=self.n_blocks,
+                n_centroids=self.n_centroids,
+                block_dim=self.block_dim,
+                head_dim=self.head_dim,
+            )
+            if metal_indices is not None:
+                return SunShapeQuantized(
+                    indices=metal_indices.astype(_compact_index_dtype(self.n_centroids)),
+                    head_dim=self.head_dim,
+                    block_dim=self.block_dim,
+                    n_blocks=self.n_blocks,
+                    passthrough_blocks=None,
+                    passthrough_values=None,
+                )
+
+        # ---- Fallback: numpy loop (supports E metric + mixed precision) ----
         keys_np = np.array(keys)
         centroids_np = np.array(self.centroids)
         E_np = np.array(self.E)

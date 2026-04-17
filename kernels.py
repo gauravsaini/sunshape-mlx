@@ -1,6 +1,6 @@
 """SunShape Metal kernels — fused block-VQ attention for Apple Silicon.
 
-Provides a custom Metal kernel that fuses the precomputed-query-centroid
+Provides custom Metal kernels that fuse the precomputed-query-centroid
 gather + score accumulation into a single GPU dispatch.  This is the
 structural advantage of block VQ: the kernel reads only the [n_tokens, n_blocks]
 index tensor + the small [n_blocks, n_centroids, block_dim] codebook,
@@ -13,9 +13,13 @@ Kernel design
 - Online softmax with cross-simdgroup reduction
 - Output in the original (un-rotated) basis
 
-For the first release, the pure-MLX path in attention.py is already
-highly optimized thanks to MLX's compiler.  This Metal kernel is
-provided for latency-critical decode (T_q=1) scenarios.
+Kernels provided
+-----------------
+1. ``sunshape_block_vq_score`` — Score-only kernel (legacy, for debug)
+2. ``sunshape_fused_attention`` — **Primary**: Fused online-softmax gather+score+softmax+value
+    accumulation in a single pass. Flash-Attention style. No intermediate scores tensor.
+3. ``sunshape_scalar_quantize`` — Scalar quantization against sorted boundaries
+4. ``sunshape_block_vq_quantize`` — Vectorized block-VQ assignment (replaces Python loop)
 """
 
 from __future__ import annotations
@@ -44,7 +48,7 @@ def get_kernel_stats() -> dict[str, int]:
 
 
 # ================================================================== #
-#  Metal kernel: Fused block-VQ attention score                       #
+#  Metal kernel: Fused block-VQ attention score (legacy/debug)        #
 # ================================================================== #
 #
 # Adapted from turboQuantPlayground's mse_score.py Metal kernel.
@@ -111,6 +115,322 @@ def block_vq_score_metal(
     except Exception:
         return None
 
+
+# ================================================================== #
+#  Metal kernel: Fused online-softmax block-VQ attention              #
+#  (Flash-Attention style — single pass, no intermediate scores)      #
+# ================================================================== #
+#
+# This is the primary optimization: fuses gather + reduce + softmax +
+# value accumulation into a single Metal kernel.  Each threadgroup
+# (= 1 simdgroup = 32 threads) processes one query head.  Within the
+# threadgroup, threads tile over the KV sequence, each maintaining
+# running online-softmax state (m, d, acc[head_dim]).
+#
+# After processing all tokens, SIMD shuffle reduction combines the
+# partial results using the online softmax correction trick:
+#   m_combined = max(m1, m2)
+#   correction = exp(m_old - m_combined)
+#   d_combined = d1 * corr1 + d2 * corr2
+#   acc_combined = acc1 * corr1 + acc2 * corr2
+#
+# Design: 32 threads (1 simdgroup) per query head — no shared memory.
+# Grid: (n_qh * 32, 1, 1)
+# Threadgroup: (32, 1, 1)
+#
+# This eliminates the O(n_qh × T_kv) intermediate scores tensor.
+
+_FUSED_ATTENTION_SOURCE = r"""
+// -------------------------------------------------------------------
+// Fused online-softmax block-VQ attention kernel
+// -------------------------------------------------------------------
+// Inputs:
+//   qdots:   (n_qh, n_blocks, n_centroids) float32
+//   indices: (T_kv, n_blocks)              uint8/uint16
+//   values:  (T_kv, head_dim)              float32
+//   params:  (4,)                          float32
+//            [0]=T_kv, [1]=n_blocks, [2]=n_centroids, [3]=head_dim
+// Output:
+//   out:     (n_qh, head_dim) float32
+//
+// 32 threads (1 simdgroup) per query head. Pure SIMD shuffle reduction.
+// -------------------------------------------------------------------
+
+// 1 simdgroup = 32 threads per query head
+uint qh = thread_position_in_grid.x / 32;
+uint tid = thread_position_in_threadgroup.x;
+
+uint T_kv = (uint)params[0];
+uint n_blocks = (uint)params[1];
+uint n_centroids = (uint)params[2];
+uint head_dim = (uint)params[3];
+uint n_qh = qdots_shape[0];
+
+if (qh >= n_qh) return;
+
+// Per-thread online softmax state
+float m_local = -1e30f;
+float d_local = 0.0f;
+float acc[256];
+for (uint i = 0; i < head_dim; i++) acc[i] = 0.0f;
+
+// Tile over KV tokens: thread tid handles tokens tid, tid+32, tid+64, ...
+for (uint t = tid; t < T_kv; t += 32) {
+    // Gather score: score = sum_b qdots[qh, b, indices[t, b]]
+    float score = 0.0f;
+    for (uint b = 0; b < n_blocks; b++) {
+        uint idx = (uint)indices[t * n_blocks + b];
+        score += qdots[(qh * n_blocks + b) * n_centroids + idx];
+    }
+
+    // Online softmax update
+    float m_new = (score > m_local) ? score : m_local;
+    float correction = exp(m_local - m_new);
+    float exp_score = exp(score - m_new);
+
+    d_local = d_local * correction + exp_score;
+    for (uint i = 0; i < head_dim; i++) {
+        acc[i] = acc[i] * correction + exp_score * values[t * head_dim + i];
+    }
+    m_local = m_new;
+}
+
+// SIMD shuffle reduction across 32 lanes → lane 0 has final result
+for (uint offset = 16; offset >= 1; offset >>= 1) {
+    float other_m = simd_shuffle_down(m_local, offset);
+    float other_d = simd_shuffle_down(d_local, offset);
+
+    float m_new = (m_local > other_m) ? m_local : other_m;
+    float corr_self = exp(m_local - m_new);
+    float corr_other = exp(other_m - m_new);
+
+    d_local = d_local * corr_self + other_d * corr_other;
+    for (uint i = 0; i < head_dim; i++) {
+        float other_acc = simd_shuffle_down(acc[i], offset);
+        acc[i] = acc[i] * corr_self + other_acc * corr_other;
+    }
+    m_local = m_new;
+}
+
+// Lane 0 writes the final output
+if (tid == 0) {
+    if (d_local > 0.0f) {
+        for (uint i = 0; i < head_dim; i++) {
+            out[qh * head_dim + i] = acc[i] / d_local;
+        }
+    } else {
+        for (uint i = 0; i < head_dim; i++) {
+            out[qh * head_dim + i] = 0.0f;
+        }
+    }
+}
+"""
+
+_fused_attention_kernel = mx.fast.metal_kernel(
+    name="sunshape_fused_attention",
+    input_names=["qdots", "indices", "values", "params"],
+    output_names=["out"],
+    source=_FUSED_ATTENTION_SOURCE,
+)
+
+
+def fused_attention_metal(
+    qdots: mx.array,
+    indices: mx.array,
+    values: mx.array,
+    n_qh: int,
+    T_kv: int,
+    n_blocks: int,
+    n_centroids: int,
+    head_dim: int,
+) -> mx.array | None:
+    """Fused online-softmax block-VQ attention — single Metal kernel.
+
+    Fuses gather + reduce + softmax + value accumulation into a single pass.
+    No intermediate scores tensor is materialized.
+
+    Uses 32 threads (1 simdgroup) per query head with pure SIMD shuffle
+    reduction. Supports head_dim up to 256.
+
+    Returns None if Metal kernels are unavailable or head_dim > 256.
+    """
+    if T_kv == 0:
+        return mx.zeros((n_qh, head_dim), dtype=mx.float32)
+    if head_dim > 256:
+        return None
+
+    try:
+        mx.eval(qdots, indices, values)
+
+        params = mx.array(
+            [float(T_kv), float(n_blocks), float(n_centroids), float(head_dim)],
+            dtype=mx.float32,
+        )
+
+        # Fixed 32 threads per threadgroup (1 simdgroup per query head)
+        grid = (n_qh * 32, 1, 1)
+        threadgroup = (32, 1, 1)
+
+        output = _fused_attention_kernel(
+            inputs=[qdots, indices, values, params],
+            output_shapes=[(n_qh, head_dim)],
+            output_dtypes=[mx.float32],
+            grid=grid,
+            threadgroup=threadgroup,
+            init_value=0.0,
+        )
+        out = output[0] if isinstance(output, (list, tuple)) else output
+        mx.eval(out)
+        _record_kernel_dispatch("sunshape_fused_attention_metal")
+        return out
+    except Exception:
+        return None
+
+
+# ================================================================== #
+#  Metal kernel: Fused online-softmax with causal mask                #
+# ================================================================== #
+# Same as above but respects a causal mask:
+#   score is masked to -inf for positions where kv_pos > q_pos.
+# q_offset = T_kv - T_q (so query i attends to keys 0..q_offset+i)
+
+_FUSED_ATTENTION_CAUSAL_SOURCE = r"""
+// Fused online-softmax block-VQ attention with causal masking
+// params: [T_kv, n_blocks, n_centroids, head_dim, q_offset]
+// 32 threads (1 simdgroup) per query head. Pure SIMD shuffle reduction.
+
+uint qh = thread_position_in_grid.x / 32;
+uint tid = thread_position_in_threadgroup.x;
+
+uint T_kv = (uint)params[0];
+uint n_blocks = (uint)params[1];
+uint n_centroids = (uint)params[2];
+uint head_dim = (uint)params[3];
+uint q_offset = (uint)params[4];
+uint n_qh = qdots_shape[0];
+
+if (qh >= n_qh) return;
+
+// q_pos for this query head
+uint q_pos = q_offset + qh;
+
+float m_local = -1e30f;
+float d_local = 0.0f;
+float acc[256];
+for (uint i = 0; i < head_dim; i++) acc[i] = 0.0f;
+
+for (uint t = tid; t < T_kv; t += 32) {
+    // Causal mask: skip if key position > query position
+    if (t > q_pos) continue;
+
+    float score = 0.0f;
+    for (uint b = 0; b < n_blocks; b++) {
+        uint idx = (uint)indices[t * n_blocks + b];
+        score += qdots[(qh * n_blocks + b) * n_centroids + idx];
+    }
+
+    float m_new = (score > m_local) ? score : m_local;
+    float correction = exp(m_local - m_new);
+    float exp_score = exp(score - m_new);
+
+    d_local = d_local * correction + exp_score;
+    for (uint i = 0; i < head_dim; i++) {
+        acc[i] = acc[i] * correction + exp_score * values[t * head_dim + i];
+    }
+    m_local = m_new;
+}
+
+// SIMD shuffle reduction across 32 lanes
+for (uint offset = 16; offset >= 1; offset >>= 1) {
+    float other_m = simd_shuffle_down(m_local, offset);
+    float other_d = simd_shuffle_down(d_local, offset);
+    float m_new = (m_local > other_m) ? m_local : other_m;
+    float corr_self = exp(m_local - m_new);
+    float corr_other = exp(other_m - m_new);
+    d_local = d_local * corr_self + other_d * corr_other;
+    for (uint i = 0; i < head_dim; i++) {
+        float other_acc = simd_shuffle_down(acc[i], offset);
+        acc[i] = acc[i] * corr_self + other_acc * corr_other;
+    }
+    m_local = m_new;
+}
+
+// Lane 0 writes output
+if (tid == 0) {
+    if (d_local > 0.0f) {
+        for (uint i = 0; i < head_dim; i++) {
+            out[qh * head_dim + i] = acc[i] / d_local;
+        }
+    } else {
+        for (uint i = 0; i < head_dim; i++) {
+            out[qh * head_dim + i] = 0.0f;
+        }
+    }
+}
+"""
+
+_fused_attention_causal_kernel = mx.fast.metal_kernel(
+    name="sunshape_fused_attention_causal",
+    input_names=["qdots", "indices", "values", "params"],
+    output_names=["out"],
+    source=_FUSED_ATTENTION_CAUSAL_SOURCE,
+)
+
+
+def fused_attention_causal_metal(
+    qdots: mx.array,
+    indices: mx.array,
+    values: mx.array,
+    n_qh: int,
+    T_kv: int,
+    n_blocks: int,
+    n_centroids: int,
+    head_dim: int,
+    q_offset: int = 0,
+) -> mx.array | None:
+    """Fused online-softmax block-VQ attention with causal mask.
+
+    Same as fused_attention_metal but applies a causal mask:
+    query at position q_offset + qh can only attend to keys at positions <= q_offset + qh.
+
+    Returns None if Metal kernels are unavailable or head_dim > 256.
+    """
+    if T_kv == 0:
+        return mx.zeros((n_qh, head_dim), dtype=mx.float32)
+    if head_dim > 256:
+        return None
+
+    try:
+        mx.eval(qdots, indices, values)
+
+        params = mx.array(
+            [float(T_kv), float(n_blocks), float(n_centroids),
+             float(head_dim), float(q_offset)],
+            dtype=mx.float32,
+        )
+
+        grid = (n_qh * 32, 1, 1)
+        threadgroup = (32, 1, 1)
+
+        output = _fused_attention_causal_kernel(
+            inputs=[qdots, indices, values, params],
+            output_shapes=[(n_qh, head_dim)],
+            output_dtypes=[mx.float32],
+            grid=grid,
+            threadgroup=threadgroup,
+            init_value=0.0,
+        )
+        out = output[0] if isinstance(output, (list, tuple)) else output
+        mx.eval(out)
+        _record_kernel_dispatch("sunshape_fused_attention_causal_metal")
+        return out
+    except Exception:
+        return None
+
+
+# ================================================================== #
+#  Metal kernel: Scalar quantization                                  #
+# ================================================================== #
 
 _SCALAR_QUANTIZE_SOURCE = """
     uint elem = thread_position_in_grid.x;
@@ -273,6 +593,110 @@ float result = (float)qval * scale_val + zero_val;
 
 out[batch_idx * D_val + coord] = result;
 """
+
+
+# ================================================================== #
+#  Metal kernel: Vectorized block-VQ quantize                         #
+# ================================================================== #
+# Replaces the Python for-loop in codec.quantize().
+# Each thread handles one (token, block) pair: finds the nearest centroid.
+#
+# Grid: (N_tokens, n_blocks, 1)
+# Inputs:
+#   keys_transformed: (N, head_dim)  — already in codec space
+#   centroids:        (n_blocks, n_centroids, block_dim)
+#   params:           (3,) = [block_dim, n_centroids, head_dim]
+# Output:
+#   out_indices: (N, n_blocks) uint8
+
+_BLOCK_VQ_QUANTIZE_SOURCE = r"""
+uint token = thread_position_in_grid.x;
+uint blk = thread_position_in_grid.y;
+
+uint N_tokens = keys_transformed_shape[0];
+uint n_blocks_val = centroids_shape[0];
+uint n_centroids_val = centroids_shape[1];
+uint block_dim_val = centroids_shape[2];
+
+if (token >= N_tokens || blk >= n_blocks_val) return;
+
+// Compute offset into key vector for this block
+uint key_offset = token * (uint)params[2] + blk * block_dim_val;
+
+// Find nearest centroid (L2 distance)
+float best_dist = 1e30f;
+uint best_idx = 0;
+
+for (uint c = 0; c < n_centroids_val; c++) {
+    float dist = 0.0f;
+    uint centroid_offset = (blk * n_centroids_val + c) * block_dim_val;
+    for (uint d = 0; d < block_dim_val; d++) {
+        float diff = keys_transformed[key_offset + d] - centroids[centroid_offset + d];
+        dist += diff * diff;
+    }
+    if (dist < best_dist) {
+        best_dist = dist;
+        best_idx = c;
+    }
+}
+
+out_indices[token * n_blocks_val + blk] = (uint8_t)best_idx;
+"""
+
+_block_vq_quantize_kernel = mx.fast.metal_kernel(
+    name="sunshape_block_vq_quantize",
+    input_names=["keys_transformed", "centroids", "params"],
+    output_names=["out_indices"],
+    source=_BLOCK_VQ_QUANTIZE_SOURCE,
+)
+
+
+def block_vq_quantize_metal(
+    keys_transformed: mx.array,
+    centroids: mx.array,
+    n_blocks: int,
+    n_centroids: int,
+    block_dim: int,
+    head_dim: int,
+) -> mx.array | None:
+    """Vectorized block-VQ quantize — single Metal kernel.
+
+    Replaces the Python for-loop in codec.quantize() when no mixed-precision
+    or local-metric transforms are needed (identity E).
+
+    Parameters
+    ----------
+    keys_transformed : (N, head_dim) float32 — keys already in codec space
+    centroids : (n_blocks, n_centroids, block_dim) float32
+    n_blocks, n_centroids, block_dim, head_dim : int
+
+    Returns None if Metal kernels are unavailable.
+    """
+    try:
+        N = keys_transformed.shape[0]
+        mx.eval(keys_transformed, centroids)
+
+        params = mx.array(
+            [float(block_dim), float(n_centroids), float(head_dim)],
+            dtype=mx.float32,
+        )
+
+        grid = (N, n_blocks, 1)
+        threadgroup = (min(256, N), 1, 1)
+
+        outputs = _block_vq_quantize_kernel(
+            inputs=[keys_transformed, centroids, params],
+            output_shapes=[(N, n_blocks)],
+            output_dtypes=[mx.uint8],
+            grid=grid,
+            threadgroup=threadgroup,
+        )
+        out = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+        mx.eval(out)
+        _record_kernel_dispatch("sunshape_block_vq_quantize_metal")
+        return out
+    except Exception:
+        return None
 
 
 # ================================================================== #
