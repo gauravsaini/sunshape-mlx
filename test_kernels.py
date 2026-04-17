@@ -331,12 +331,9 @@ def test_fused_attention_metal():
     weights_ref = weights_ref / weights_ref.sum(axis=-1, keepdims=True)
     output_ref = weights_ref @ values_np
 
-    # Precompute qdots
-    q_blocks = query_np.reshape(T_q, n_blocks, block_dim)
-    qdots_np = np.einsum('qbd,bcd->qbc', q_blocks, centroids)
-
     result = fused_attention_metal(
-        mx.array(qdots_np), mx.array(indices_np), mx.array(values_np),
+        mx.array(query_np), mx.array(centroids),
+        mx.array(indices_np), mx.array(values_np),
         n_qh=T_q, T_kv=T_kv,
         n_blocks=n_blocks, n_centroids=n_centroids,
         head_dim=head_dim,
@@ -385,12 +382,9 @@ def test_fused_attention_causal_metal():
     weights_ref = weights_ref / weights_ref.sum(axis=-1, keepdims=True)
     output_ref = weights_ref @ values_np
 
-    # Precompute qdots
-    q_blocks = query_np.reshape(T_q, n_blocks, block_dim)
-    qdots_np = np.einsum('qbd,bcd->qbc', q_blocks, centroids)
-
     result = fused_attention_causal_metal(
-        mx.array(qdots_np), mx.array(indices_np), mx.array(values_np),
+        mx.array(query_np), mx.array(centroids),
+        mx.array(indices_np), mx.array(values_np),
         n_qh=T_q, T_kv=T_kv,
         n_blocks=n_blocks, n_centroids=n_centroids,
         head_dim=head_dim,
@@ -470,11 +464,9 @@ def test_fused_attention_larger_seq():
     weights_ref = weights_ref / weights_ref.sum(axis=-1, keepdims=True)
     output_ref = weights_ref @ values_np
 
-    q_blocks = query_np.reshape(T_q, n_blocks, block_dim)
-    qdots_np = np.einsum('qbd,bcd->qbc', q_blocks, centroids)
-
     result = fused_attention_metal(
-        mx.array(qdots_np), mx.array(indices_np), mx.array(values_np),
+        mx.array(query_np), mx.array(centroids),
+        mx.array(indices_np), mx.array(values_np),
         n_qh=T_q, T_kv=T_kv,
         n_blocks=n_blocks, n_centroids=n_centroids,
         head_dim=head_dim,
@@ -527,12 +519,9 @@ def test_fused_attention_dequant_metal():
     weights_ref = weights_ref / weights_ref.sum(axis=-1, keepdims=True)
     output_ref = weights_ref @ values_deq_np
 
-    # Precompute qdots
-    q_blocks = query_np.reshape(T_q, n_blocks, block_dim)
-    qdots_np = np.einsum('qbd,bcd->qbc', q_blocks, centroids)
-
     result = fused_attention_dequant_metal(
-        mx.array(qdots_np), mx.array(indices_np),
+        mx.array(query_np), mx.array(centroids),
+        mx.array(indices_np),
         packed, scales, zeros,
         n_qh=T_q, T_kv=T_kv,
         n_blocks=n_blocks, n_centroids=n_centroids,
@@ -590,11 +579,9 @@ def test_fused_attention_dequant_causal_metal():
     weights_ref = weights_ref / weights_ref.sum(axis=-1, keepdims=True)
     output_ref = weights_ref @ values_deq_np
 
-    q_blocks = query_np.reshape(T_q, n_blocks, block_dim)
-    qdots_np = np.einsum('qbd,bcd->qbc', q_blocks, centroids)
-
     result = fused_attention_dequant_causal_metal(
-        mx.array(qdots_np), mx.array(indices_np),
+        mx.array(query_np), mx.array(centroids),
+        mx.array(indices_np),
         packed, scales, zeros,
         n_qh=T_q, T_kv=T_kv,
         n_blocks=n_blocks, n_centroids=n_centroids,
@@ -645,11 +632,9 @@ def test_fused_attention_dequant_2bit():
     weights_ref = weights_ref / weights_ref.sum(axis=-1, keepdims=True)
     output_ref = weights_ref @ values_deq_np
 
-    q_blocks = query_np.reshape(T_q, n_blocks, block_dim)
-    qdots_np = np.einsum('qbd,bcd->qbc', q_blocks, centroids)
-
     result = fused_attention_dequant_metal(
-        mx.array(qdots_np), mx.array(indices_np),
+        mx.array(query_np), mx.array(centroids),
+        mx.array(indices_np),
         packed, scales, zeros,
         n_qh=T_q, T_kv=T_kv,
         n_blocks=n_blocks, n_centroids=n_centroids,

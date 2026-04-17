@@ -144,16 +144,17 @@ _FUSED_ATTENTION_SOURCE = r"""
 // Fused online-softmax block-VQ attention kernel (optimized)
 // -------------------------------------------------------------------
 // Inputs:
-//   qdots:   (n_qh, n_blocks, n_centroids) float32
-//   indices: (T_kv, n_blocks)              uint8/uint16
-//   values:  (T_kv, head_dim)              float32
-//   params:  (4,)                          float32
-//            [0]=T_kv, [1]=n_blocks, [2]=n_centroids, [3]=head_dim
+//   queries:   (n_qh, head_dim)              float32
+//   centroids: (n_blocks, n_centroids, block_dim) float32
+//   indices:   (T_kv, n_blocks)              uint8/uint16
+//   values:    (T_kv, head_dim)              float32
+//   params:    (4,)                          float32
+//              [0]=T_kv, [1]=n_blocks, [2]=n_centroids, [3]=head_dim
 // Output:
 //   out:     (n_qh, head_dim) float32
 //
 // head_dim threads per query head.  Thread-per-dimension layout.
-// qdots cached in threadgroup memory.  No SIMD reduction.
+// qdots computing and caching in threadgroup memory.  No SIMD reduction.
 // -------------------------------------------------------------------
 
 uint head_dim = (uint)params[3];
@@ -163,18 +164,29 @@ uint dim_id = thread_position_in_threadgroup.x;
 uint T_kv    = (uint)params[0];
 uint n_blocks   = (uint)params[1];
 uint n_centroids = (uint)params[2];
-uint n_qh = qdots_shape[0];
+uint n_qh = queries_shape[0];
 
 if (qh >= n_qh || dim_id >= head_dim) return;
 
-// ---- Cache qdots[qh, :, :] in threadgroup memory ----
+// ---- Compute and cache qdots in threadgroup memory ----
 // Size: n_blocks * n_centroids floats (typically 16 * 256 = 4096 = 16 KB)
 threadgroup float tg_qdots[4096];  // 16 * 256 max
 
 uint qdots_size = n_blocks * n_centroids;
-uint qdots_base = qh * qdots_size;
+uint block_dim = head_dim / n_blocks;
+
 for (uint i = dim_id; i < qdots_size; i += head_dim) {
-    tg_qdots[i] = qdots[qdots_base + i];
+    uint b = i / n_centroids;
+    uint c = i % n_centroids;
+    
+    uint q_base = qh * head_dim + b * block_dim;
+    uint cent_base = (b * n_centroids + c) * block_dim;
+    
+    float dot = 0.0f;
+    for (uint k = 0; k < block_dim; k++) {
+        dot += queries[q_base + k] * centroids[cent_base + k];
+    }
+    tg_qdots[i] = dot;
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -212,14 +224,15 @@ if (d_local > 0.0f) {
 
 _fused_attention_kernel = mx.fast.metal_kernel(
     name="sunshape_fused_attention",
-    input_names=["qdots", "indices", "values", "params"],
+    input_names=["queries", "centroids", "indices", "values", "params"],
     output_names=["out"],
     source=_FUSED_ATTENTION_SOURCE,
 )
 
 
 def fused_attention_metal(
-    qdots: mx.array,
+    queries: mx.array,
+    centroids: mx.array,
     indices: mx.array,
     values: mx.array,
     n_qh: int,
@@ -251,7 +264,7 @@ def fused_attention_metal(
         return None
 
     try:
-        mx.eval(qdots, indices, values)
+        mx.eval(queries, centroids, indices, values)
 
         params = mx.array(
             [float(T_kv), float(n_blocks), float(n_centroids), float(head_dim)],
@@ -263,7 +276,7 @@ def fused_attention_metal(
         threadgroup = (head_dim, 1, 1)
 
         output = _fused_attention_kernel(
-            inputs=[qdots, indices, values, params],
+            inputs=[queries, centroids, indices, values, params],
             output_shapes=[(n_qh, head_dim)],
             output_dtypes=[mx.float32],
             grid=grid,
@@ -291,7 +304,7 @@ _FUSED_ATTENTION_CAUSAL_SOURCE = r"""
 // Fused online-softmax block-VQ attention with causal masking (optimized)
 // params: [T_kv, n_blocks, n_centroids, head_dim, q_offset]
 // head_dim threads per query head.  Thread-per-dimension layout.
-// qdots cached in threadgroup memory.  No SIMD reduction.
+// qdots computing and caching in threadgroup memory.  No SIMD reduction.
 
 uint head_dim = (uint)params[3];
 uint qh = thread_position_in_grid.x / head_dim;
@@ -301,20 +314,31 @@ uint T_kv       = (uint)params[0];
 uint n_blocks   = (uint)params[1];
 uint n_centroids = (uint)params[2];
 uint q_offset   = (uint)params[4];
-uint n_qh = qdots_shape[0];
+uint n_qh = queries_shape[0];
 
 if (qh >= n_qh || dim_id >= head_dim) return;
 
 // q_pos for this query head
 uint q_pos = q_offset + qh;
 
-// ---- Cache qdots[qh, :, :] in threadgroup memory ----
+// ---- Compute and cache qdots in threadgroup memory ----
 threadgroup float tg_qdots[4096];  // 16 * 256 max
 
 uint qdots_size = n_blocks * n_centroids;
-uint qdots_base = qh * qdots_size;
+uint block_dim  = head_dim / n_blocks;
+
 for (uint i = dim_id; i < qdots_size; i += head_dim) {
-    tg_qdots[i] = qdots[qdots_base + i];
+    uint b = i / n_centroids;
+    uint c = i % n_centroids;
+    
+    uint q_base = qh * head_dim + b * block_dim;
+    uint cent_base = (b * n_centroids + c) * block_dim;
+    
+    float dot = 0.0f;
+    for (uint k = 0; k < block_dim; k++) {
+        dot += queries[q_base + k] * centroids[cent_base + k];
+    }
+    tg_qdots[i] = dot;
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -355,14 +379,15 @@ if (d_local > 0.0f) {
 
 _fused_attention_causal_kernel = mx.fast.metal_kernel(
     name="sunshape_fused_attention_causal",
-    input_names=["qdots", "indices", "values", "params"],
+    input_names=["queries", "centroids", "indices", "values", "params"],
     output_names=["out"],
     source=_FUSED_ATTENTION_CAUSAL_SOURCE,
 )
 
 
 def fused_attention_causal_metal(
-    qdots: mx.array,
+    queries: mx.array,
+    centroids: mx.array,
     indices: mx.array,
     values: mx.array,
     n_qh: int,
@@ -393,7 +418,7 @@ def fused_attention_causal_metal(
         return None
 
     try:
-        mx.eval(qdots, indices, values)
+        mx.eval(queries, centroids, indices, values)
 
         params = mx.array(
             [float(T_kv), float(n_blocks), float(n_centroids),
@@ -406,7 +431,7 @@ def fused_attention_causal_metal(
         threadgroup = (head_dim, 1, 1)
 
         output = _fused_attention_causal_kernel(
-            inputs=[qdots, indices, values, params],
+            inputs=[queries, centroids, indices, values, params],
             output_shapes=[(n_qh, head_dim)],
             output_dtypes=[mx.float32],
             grid=grid,
@@ -565,7 +590,8 @@ _FUSED_ATTENTION_DEQUANT_SOURCE = r"""
 // Fused attention + in-register value dequantization kernel
 // -------------------------------------------------------------------
 // Inputs:
-//   qdots:         (n_qh, n_blocks, n_centroids) float32
+//   queries:       (n_qh, head_dim)              float32
+//   centroids:     (n_blocks, n_centroids, block_dim) float32
 //   indices:       (T_kv, n_blocks)              uint8/uint16  — key VQ indices
 //   packed_values: (T_kv, packed_dim)            uint32        — bit-packed values
 //   scales:        (T_kv, n_groups)              float32
@@ -588,7 +614,7 @@ uint bits          = (uint)params[4];
 uint vals_per_word = (uint)params[5];
 uint bit_mask      = (uint)params[6];
 uint group_size    = (uint)params[7];
-uint n_qh          = qdots_shape[0];
+uint n_qh          = queries_shape[0];
 
 if (qh >= n_qh || dim_id >= head_dim) return;
 
@@ -600,13 +626,24 @@ uint sub_idx    = dim_id % vals_per_word;
 uint shift      = sub_idx * bits;
 uint group_idx  = dim_id / group_size;
 
-// ---- Cache qdots[qh, :, :] in threadgroup memory ----
+// ---- Compute and cache qdots in threadgroup memory ----
 threadgroup float tg_qdots[4096];  // 16 * 256 max
 
 uint qdots_size = n_blocks * n_centroids;
-uint qdots_base = qh * qdots_size;
+uint block_dim  = head_dim / n_blocks;
+
 for (uint i = dim_id; i < qdots_size; i += head_dim) {
-    tg_qdots[i] = qdots[qdots_base + i];
+    uint b = i / n_centroids;
+    uint c = i % n_centroids;
+    
+    uint q_base = qh * head_dim + b * block_dim;
+    uint cent_base = (b * n_centroids + c) * block_dim;
+    
+    float dot = 0.0f;
+    for (uint k = 0; k < block_dim; k++) {
+        dot += queries[q_base + k] * centroids[cent_base + k];
+    }
+    tg_qdots[i] = dot;
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -651,14 +688,15 @@ if (d_local > 0.0f) {
 
 _fused_attention_dequant_kernel = mx.fast.metal_kernel(
     name="sunshape_fused_attention_dequant",
-    input_names=["qdots", "indices", "packed_values", "scales", "zeros", "params"],
+    input_names=["queries", "centroids", "indices", "packed_values", "scales", "zeros", "params"],
     output_names=["out"],
     source=_FUSED_ATTENTION_DEQUANT_SOURCE,
 )
 
 
 def fused_attention_dequant_metal(
-    qdots: mx.array,
+    queries: mx.array,
+    centroids: mx.array,
     indices: mx.array,
     packed_values: mx.array,
     scales: mx.array,
@@ -700,7 +738,7 @@ def fused_attention_dequant_metal(
     bit_mask = (1 << bits) - 1  # 0x3 for 2-bit, 0xF for 4-bit
 
     try:
-        mx.eval(qdots, indices, packed_values, scales, zeros)
+        mx.eval(queries, centroids, indices, packed_values, scales, zeros)
 
         params = mx.array(
             [float(T_kv), float(n_blocks), float(n_centroids), float(head_dim),
@@ -712,7 +750,7 @@ def fused_attention_dequant_metal(
         threadgroup = (head_dim, 1, 1)
 
         output = _fused_attention_dequant_kernel(
-            inputs=[qdots, indices, packed_values, scales, zeros, params],
+            inputs=[queries, centroids, indices, packed_values, scales, zeros, params],
             output_shapes=[(n_qh, head_dim)],
             output_dtypes=[mx.float32],
             grid=grid,
@@ -748,7 +786,7 @@ uint vals_per_word = (uint)params[5];
 uint bit_mask      = (uint)params[6];
 uint group_size    = (uint)params[7];
 uint q_offset      = (uint)params[8];
-uint n_qh          = qdots_shape[0];
+uint n_qh          = queries_shape[0];
 
 if (qh >= n_qh || dim_id >= head_dim) return;
 
@@ -762,13 +800,24 @@ uint sub_idx    = dim_id % vals_per_word;
 uint shift      = sub_idx * bits;
 uint group_idx  = dim_id / group_size;
 
-// ---- Cache qdots in threadgroup memory ----
+// ---- Compute and cache qdots in threadgroup memory ----
 threadgroup float tg_qdots[4096];
 
 uint qdots_size = n_blocks * n_centroids;
-uint qdots_base = qh * qdots_size;
+uint block_dim  = head_dim / n_blocks;
+
 for (uint i = dim_id; i < qdots_size; i += head_dim) {
-    tg_qdots[i] = qdots[qdots_base + i];
+    uint b = i / n_centroids;
+    uint c = i % n_centroids;
+    
+    uint q_base = qh * head_dim + b * block_dim;
+    uint cent_base = (b * n_centroids + c) * block_dim;
+    
+    float dot = 0.0f;
+    for (uint k = 0; k < block_dim; k++) {
+        dot += queries[q_base + k] * centroids[cent_base + k];
+    }
+    tg_qdots[i] = dot;
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -812,14 +861,15 @@ if (d_local > 0.0f) {
 
 _fused_attention_dequant_causal_kernel = mx.fast.metal_kernel(
     name="sunshape_fused_attention_dequant_causal",
-    input_names=["qdots", "indices", "packed_values", "scales", "zeros", "params"],
+    input_names=["queries", "centroids", "indices", "packed_values", "scales", "zeros", "params"],
     output_names=["out"],
     source=_FUSED_ATTENTION_DEQUANT_CAUSAL_SOURCE,
 )
 
 
 def fused_attention_dequant_causal_metal(
-    qdots: mx.array,
+    queries: mx.array,
+    centroids: mx.array,
     indices: mx.array,
     packed_values: mx.array,
     scales: mx.array,
@@ -850,7 +900,7 @@ def fused_attention_dequant_causal_metal(
     bit_mask = (1 << bits) - 1
 
     try:
-        mx.eval(qdots, indices, packed_values, scales, zeros)
+        mx.eval(queries, centroids, indices, packed_values, scales, zeros)
 
         params = mx.array(
             [float(T_kv), float(n_blocks), float(n_centroids), float(head_dim),
@@ -863,7 +913,7 @@ def fused_attention_dequant_causal_metal(
         threadgroup = (head_dim, 1, 1)
 
         output = _fused_attention_dequant_causal_kernel(
-            inputs=[qdots, indices, packed_values, scales, zeros, params],
+            inputs=[queries, centroids, indices, packed_values, scales, zeros, params],
             output_shapes=[(n_qh, head_dim)],
             output_dtypes=[mx.float32],
             grid=grid,
