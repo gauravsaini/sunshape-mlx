@@ -121,28 +121,27 @@ def block_vq_score_metal(
 #  (Flash-Attention style — single pass, no intermediate scores)      #
 # ================================================================== #
 #
-# This is the primary optimization: fuses gather + reduce + softmax +
-# value accumulation into a single Metal kernel.  Each threadgroup
-# (= 1 simdgroup = 32 threads) processes one query head.  Within the
-# threadgroup, threads tile over the KV sequence, each maintaining
-# running online-softmax state (m, d, acc[head_dim]).
+# Optimized design:
+# - Threadgroup: head_dim threads (e.g., 128) per query head
+# - qdots table cached in threadgroup shared memory (16KB for 16×256)
+# - Thread-per-dimension layout: each thread owns exactly 1 output dim
+# - No SIMD reduction needed — all threads see the same score via
+#   shared tg_qdots, so online softmax state is implicitly synchronized
+# - Value loop eliminated: 1 load + 1 FMA per token per thread
+#    (was 128 loads + 128 FMA in the old design)
 #
-# After processing all tokens, SIMD shuffle reduction combines the
-# partial results using the online softmax correction trick:
-#   m_combined = max(m1, m2)
-#   correction = exp(m_old - m_combined)
-#   d_combined = d1 * corr1 + d2 * corr2
-#   acc_combined = acc1 * corr1 + acc2 * corr2
-#
-# Design: 32 threads (1 simdgroup) per query head — no shared memory.
-# Grid: (n_qh * 32, 1, 1)
-# Threadgroup: (32, 1, 1)
+# Grid: (n_qh * head_dim, 1, 1)
+# Threadgroup: (head_dim, 1, 1)
 #
 # This eliminates the O(n_qh × T_kv) intermediate scores tensor.
 
+# Maximum qdots table size in floats: n_blocks * n_centroids
+# Typical: 16 * 256 = 4096  (16 KB).  Metal threadgroup limit is 32 KB.
+_MAX_QDOTS_TG = 16 * 256  # compile-time upper bound for threadgroup array
+
 _FUSED_ATTENTION_SOURCE = r"""
 // -------------------------------------------------------------------
-// Fused online-softmax block-VQ attention kernel
+// Fused online-softmax block-VQ attention kernel (optimized)
 // -------------------------------------------------------------------
 // Inputs:
 //   qdots:   (n_qh, n_blocks, n_centroids) float32
@@ -153,34 +152,44 @@ _FUSED_ATTENTION_SOURCE = r"""
 // Output:
 //   out:     (n_qh, head_dim) float32
 //
-// 32 threads (1 simdgroup) per query head. Pure SIMD shuffle reduction.
+// head_dim threads per query head.  Thread-per-dimension layout.
+// qdots cached in threadgroup memory.  No SIMD reduction.
 // -------------------------------------------------------------------
 
-// 1 simdgroup = 32 threads per query head
-uint qh = thread_position_in_grid.x / 32;
-uint tid = thread_position_in_threadgroup.x;
-
-uint T_kv = (uint)params[0];
-uint n_blocks = (uint)params[1];
-uint n_centroids = (uint)params[2];
 uint head_dim = (uint)params[3];
+uint qh = thread_position_in_grid.x / head_dim;
+uint dim_id = thread_position_in_threadgroup.x;
+
+uint T_kv    = (uint)params[0];
+uint n_blocks   = (uint)params[1];
+uint n_centroids = (uint)params[2];
 uint n_qh = qdots_shape[0];
 
-if (qh >= n_qh) return;
+if (qh >= n_qh || dim_id >= head_dim) return;
 
-// Per-thread online softmax state
+// ---- Cache qdots[qh, :, :] in threadgroup memory ----
+// Size: n_blocks * n_centroids floats (typically 16 * 256 = 4096 = 16 KB)
+threadgroup float tg_qdots[4096];  // 16 * 256 max
+
+uint qdots_size = n_blocks * n_centroids;
+uint qdots_base = qh * qdots_size;
+for (uint i = dim_id; i < qdots_size; i += head_dim) {
+    tg_qdots[i] = qdots[qdots_base + i];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// ---- Per-thread online softmax state (single dimension) ----
 float m_local = -1e30f;
 float d_local = 0.0f;
-float acc[256];
-for (uint i = 0; i < head_dim; i++) acc[i] = 0.0f;
+float acc = 0.0f;
 
-// Tile over KV tokens: thread tid handles tokens tid, tid+32, tid+64, ...
-for (uint t = tid; t < T_kv; t += 32) {
-    // Gather score: score = sum_b qdots[qh, b, indices[t, b]]
+// ---- Process ALL tokens (each thread handles its own dim_id) ----
+for (uint t = 0; t < T_kv; t++) {
+    // Gather score from shared threadgroup memory
     float score = 0.0f;
     for (uint b = 0; b < n_blocks; b++) {
         uint idx = (uint)indices[t * n_blocks + b];
-        score += qdots[(qh * n_blocks + b) * n_centroids + idx];
+        score += tg_qdots[b * n_centroids + idx];
     }
 
     // Online softmax update
@@ -189,40 +198,15 @@ for (uint t = tid; t < T_kv; t += 32) {
     float exp_score = exp(score - m_new);
 
     d_local = d_local * correction + exp_score;
-    for (uint i = 0; i < head_dim; i++) {
-        acc[i] = acc[i] * correction + exp_score * values[t * head_dim + i];
-    }
+    acc = acc * correction + exp_score * values[t * head_dim + dim_id];
     m_local = m_new;
 }
 
-// SIMD shuffle reduction across 32 lanes → lane 0 has final result
-for (uint offset = 16; offset >= 1; offset >>= 1) {
-    float other_m = simd_shuffle_down(m_local, offset);
-    float other_d = simd_shuffle_down(d_local, offset);
-
-    float m_new = (m_local > other_m) ? m_local : other_m;
-    float corr_self = exp(m_local - m_new);
-    float corr_other = exp(other_m - m_new);
-
-    d_local = d_local * corr_self + other_d * corr_other;
-    for (uint i = 0; i < head_dim; i++) {
-        float other_acc = simd_shuffle_down(acc[i], offset);
-        acc[i] = acc[i] * corr_self + other_acc * corr_other;
-    }
-    m_local = m_new;
-}
-
-// Lane 0 writes the final output
-if (tid == 0) {
-    if (d_local > 0.0f) {
-        for (uint i = 0; i < head_dim; i++) {
-            out[qh * head_dim + i] = acc[i] / d_local;
-        }
-    } else {
-        for (uint i = 0; i < head_dim; i++) {
-            out[qh * head_dim + i] = 0.0f;
-        }
-    }
+// ---- Write output (each thread writes its own dimension) ----
+if (d_local > 0.0f) {
+    out[qh * head_dim + dim_id] = acc / d_local;
+} else {
+    out[qh * head_dim + dim_id] = 0.0f;
 }
 """
 
@@ -249,14 +233,21 @@ def fused_attention_metal(
     Fuses gather + reduce + softmax + value accumulation into a single pass.
     No intermediate scores tensor is materialized.
 
-    Uses 32 threads (1 simdgroup) per query head with pure SIMD shuffle
-    reduction. Supports head_dim up to 256.
+    Optimized design:
+    - head_dim threads per query head (thread-per-dimension layout)
+    - qdots cached in threadgroup shared memory
+    - Each thread accumulates a single output dimension (no value loop)
+    - No SIMD reduction needed
 
-    Returns None if Metal kernels are unavailable or head_dim > 256.
+    Supports head_dim up to 256 and n_blocks * n_centroids <= 4096.
+
+    Returns None if Metal kernels are unavailable or dimensions exceed limits.
     """
     if T_kv == 0:
         return mx.zeros((n_qh, head_dim), dtype=mx.float32)
     if head_dim > 256:
+        return None
+    if n_blocks * n_centroids > _MAX_QDOTS_TG:
         return None
 
     try:
@@ -267,9 +258,9 @@ def fused_attention_metal(
             dtype=mx.float32,
         )
 
-        # Fixed 32 threads per threadgroup (1 simdgroup per query head)
-        grid = (n_qh * 32, 1, 1)
-        threadgroup = (32, 1, 1)
+        # head_dim threads per threadgroup (1 thread per output dimension)
+        grid = (n_qh * head_dim, 1, 1)
+        threadgroup = (head_dim, 1, 1)
 
         output = _fused_attention_kernel(
             inputs=[qdots, indices, values, params],
@@ -290,82 +281,75 @@ def fused_attention_metal(
 # ================================================================== #
 #  Metal kernel: Fused online-softmax with causal mask                #
 # ================================================================== #
-# Same as above but respects a causal mask:
+# Same optimized design as above but respects a causal mask:
 #   score is masked to -inf for positions where kv_pos > q_pos.
 # q_offset = T_kv - T_q (so query i attends to keys 0..q_offset+i)
+#
+# Thread-per-dimension layout with qdots in threadgroup memory.
 
 _FUSED_ATTENTION_CAUSAL_SOURCE = r"""
-// Fused online-softmax block-VQ attention with causal masking
+// Fused online-softmax block-VQ attention with causal masking (optimized)
 // params: [T_kv, n_blocks, n_centroids, head_dim, q_offset]
-// 32 threads (1 simdgroup) per query head. Pure SIMD shuffle reduction.
+// head_dim threads per query head.  Thread-per-dimension layout.
+// qdots cached in threadgroup memory.  No SIMD reduction.
 
-uint qh = thread_position_in_grid.x / 32;
-uint tid = thread_position_in_threadgroup.x;
-
-uint T_kv = (uint)params[0];
-uint n_blocks = (uint)params[1];
-uint n_centroids = (uint)params[2];
 uint head_dim = (uint)params[3];
-uint q_offset = (uint)params[4];
+uint qh = thread_position_in_grid.x / head_dim;
+uint dim_id = thread_position_in_threadgroup.x;
+
+uint T_kv       = (uint)params[0];
+uint n_blocks   = (uint)params[1];
+uint n_centroids = (uint)params[2];
+uint q_offset   = (uint)params[4];
 uint n_qh = qdots_shape[0];
 
-if (qh >= n_qh) return;
+if (qh >= n_qh || dim_id >= head_dim) return;
 
 // q_pos for this query head
 uint q_pos = q_offset + qh;
 
+// ---- Cache qdots[qh, :, :] in threadgroup memory ----
+threadgroup float tg_qdots[4096];  // 16 * 256 max
+
+uint qdots_size = n_blocks * n_centroids;
+uint qdots_base = qh * qdots_size;
+for (uint i = dim_id; i < qdots_size; i += head_dim) {
+    tg_qdots[i] = qdots[qdots_base + i];
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// ---- Per-thread online softmax state (single dimension) ----
 float m_local = -1e30f;
 float d_local = 0.0f;
-float acc[256];
-for (uint i = 0; i < head_dim; i++) acc[i] = 0.0f;
+float acc = 0.0f;
 
-for (uint t = tid; t < T_kv; t += 32) {
+// ---- Process tokens up to causal bound ----
+for (uint t = 0; t < T_kv; t++) {
     // Causal mask: skip if key position > query position
     if (t > q_pos) continue;
 
+    // Gather score from shared threadgroup memory
     float score = 0.0f;
     for (uint b = 0; b < n_blocks; b++) {
         uint idx = (uint)indices[t * n_blocks + b];
-        score += qdots[(qh * n_blocks + b) * n_centroids + idx];
+        score += tg_qdots[b * n_centroids + idx];
     }
 
+    // Online softmax update
     float m_new = (score > m_local) ? score : m_local;
     float correction = exp(m_local - m_new);
     float exp_score = exp(score - m_new);
 
     d_local = d_local * correction + exp_score;
-    for (uint i = 0; i < head_dim; i++) {
-        acc[i] = acc[i] * correction + exp_score * values[t * head_dim + i];
-    }
+    acc = acc * correction + exp_score * values[t * head_dim + dim_id];
     m_local = m_new;
 }
 
-// SIMD shuffle reduction across 32 lanes
-for (uint offset = 16; offset >= 1; offset >>= 1) {
-    float other_m = simd_shuffle_down(m_local, offset);
-    float other_d = simd_shuffle_down(d_local, offset);
-    float m_new = (m_local > other_m) ? m_local : other_m;
-    float corr_self = exp(m_local - m_new);
-    float corr_other = exp(other_m - m_new);
-    d_local = d_local * corr_self + other_d * corr_other;
-    for (uint i = 0; i < head_dim; i++) {
-        float other_acc = simd_shuffle_down(acc[i], offset);
-        acc[i] = acc[i] * corr_self + other_acc * corr_other;
-    }
-    m_local = m_new;
-}
-
-// Lane 0 writes output
-if (tid == 0) {
-    if (d_local > 0.0f) {
-        for (uint i = 0; i < head_dim; i++) {
-            out[qh * head_dim + i] = acc[i] / d_local;
-        }
-    } else {
-        for (uint i = 0; i < head_dim; i++) {
-            out[qh * head_dim + i] = 0.0f;
-        }
-    }
+// ---- Write output (each thread writes its own dimension) ----
+if (d_local > 0.0f) {
+    out[qh * head_dim + dim_id] = acc / d_local;
+} else {
+    out[qh * head_dim + dim_id] = 0.0f;
 }
 """
 
@@ -393,11 +377,19 @@ def fused_attention_causal_metal(
     Same as fused_attention_metal but applies a causal mask:
     query at position q_offset + qh can only attend to keys at positions <= q_offset + qh.
 
-    Returns None if Metal kernels are unavailable or head_dim > 256.
+    Optimized design:
+    - head_dim threads per query head (thread-per-dimension layout)
+    - qdots cached in threadgroup shared memory
+    - Each thread accumulates a single output dimension
+    - No SIMD reduction needed
+
+    Returns None if Metal kernels are unavailable or dimensions exceed limits.
     """
     if T_kv == 0:
         return mx.zeros((n_qh, head_dim), dtype=mx.float32)
     if head_dim > 256:
+        return None
+    if n_blocks * n_centroids > _MAX_QDOTS_TG:
         return None
 
     try:
@@ -409,8 +401,9 @@ def fused_attention_causal_metal(
             dtype=mx.float32,
         )
 
-        grid = (n_qh * 32, 1, 1)
-        threadgroup = (32, 1, 1)
+        # head_dim threads per threadgroup (1 thread per output dimension)
+        grid = (n_qh * head_dim, 1, 1)
+        threadgroup = (head_dim, 1, 1)
 
         output = _fused_attention_causal_kernel(
             inputs=[qdots, indices, values, params],
